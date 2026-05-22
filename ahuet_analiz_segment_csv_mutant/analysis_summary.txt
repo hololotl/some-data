@@ -1,0 +1,7 @@
+Analysis Summary
+Manual RMSE: 2.591
+Mutant RMSE: 2.277
+Manual MAE: 1.482
+Mutant MAE: 1.233
+Stability (RMSE std across CV folds): manual=0.164, mutant=0.134
+Segments count: manual=8, mutant=10

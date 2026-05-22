@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
 
@@ -15,9 +16,33 @@ RESTAURANT_COLUMN = os.getenv("ORDERS_RESTAURANT_COLUMN", "location_id")
 OUTPUT_DIR = Path(os.getenv("ANALYSIS_OUTPUT_DIR", "analysis_output"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SHOW_PLOTS = os.getenv("SHOW_PLOTS", "0") == "1"
+TIME_BUCKET_BASE_FREQ = os.getenv("TIME_BUCKET_BASE_FREQ", "30min")
+
+TIME_BUCKETS = [
+    ("night_22_06", 22, 6),
+    ("morning_07_10", 7, 10),
+    ("midday_11_13", 11, 13),
+    ("afternoon_14_16", 14, 16),
+    ("peak_17_18", 17, 18),
+    ("evening_19_21", 19, 21),
+]
 
 def build_engine():
     return create_engine(DB_URL)
+
+def load_work_hours_df(engine):
+    wh_sql = (
+        "SELECT location_id, weekday, working, start_hour, start_minutes, "
+        "finish_hour, finish_minutes FROM work_hours where working = true"
+    )
+    try:
+        work_hours_df = pd.read_sql_query(text(wh_sql), engine)
+    except Exception:
+        return None
+    if work_hours_df.empty:
+        return None
+    work_hours_df["location_id"] = work_hours_df["location_id"].astype(str)
+    return work_hours_df
 
 def show_schema(engine):
     inspector = inspect(engine)
@@ -59,6 +84,314 @@ def prepare_data(df):
     df["weekday_name"] = df[TIMESTAMP_COLUMN].dt.day_name()
     df["month"] = df[TIMESTAMP_COLUMN].dt.to_period("M").astype(str)
     return df
+
+def filter_min_orders(data, min_orders):
+    if min_orders is None:
+        return data
+    orders_per_rest = data.groupby(RESTAURANT_COLUMN).size()
+    valid_rests = orders_per_rest[orders_per_rest >= min_orders].index
+    return data[data[RESTAURANT_COLUMN].isin(valid_rests)]
+
+def build_completed_slots(data, freq, work_hours_df=None):
+    restaurant_ids = data[RESTAURANT_COLUMN].dropna().astype(str).unique().tolist()
+    if not restaurant_ids:
+        return pd.DataFrame(columns=[RESTAURANT_COLUMN, TIMESTAMP_COLUMN, "orders"])
+
+    start = data[TIMESTAMP_COLUMN].min().floor(freq)
+    end = data[TIMESTAMP_COLUMN].max().ceil(freq)
+    periods = pd.date_range(start=start, end=end, freq=freq)
+
+    grouped = (
+        data.groupby([RESTAURANT_COLUMN, pd.Grouper(key=TIMESTAMP_COLUMN, freq=freq)])
+        .size()
+        .rename("orders")
+        .reset_index()
+    )
+
+    restaurant_ids_df = pd.DataFrame({RESTAURANT_COLUMN: restaurant_ids})
+    periods_df = pd.DataFrame({TIMESTAMP_COLUMN: periods})
+    periods_df["slot_hour"] = periods_df[TIMESTAMP_COLUMN].dt.hour
+    periods_df["slot_minute"] = (
+        periods_df[TIMESTAMP_COLUMN].dt.hour * 60 + periods_df[TIMESTAMP_COLUMN].dt.minute
+    )
+    periods_df["slot_weekday"] = periods_df[TIMESTAMP_COLUMN].dt.dayofweek
+
+    candidate_slots = restaurant_ids_df.merge(periods_df, how="cross")
+
+    if work_hours_df is not None and not work_hours_df.empty:
+        cs = candidate_slots.merge(
+            work_hours_df,
+            left_on=[RESTAURANT_COLUMN, "slot_weekday"],
+            right_on=["location_id", "weekday"],
+            how="left",
+        )
+
+        def slot_in_range(row):
+            if pd.isna(row.get("working")) or not bool(row.get("working")):
+                return False
+            start_min = int(row.get("start_hour", 0)) * 60 + int(row.get("start_minutes", 0))
+            finish_min = int(row.get("finish_hour", 0)) * 60 + int(row.get("finish_minutes", 0))
+            sm = int(row.get("slot_minute", 0))
+            if start_min <= finish_min:
+                return (sm >= start_min) and (sm <= finish_min)
+            return (sm >= start_min) or (sm <= finish_min)
+
+        cs["in_work"] = cs.apply(slot_in_range, axis=1)
+        working_slots = cs[cs["in_work"]][[RESTAURANT_COLUMN, TIMESTAMP_COLUMN]]
+    else:
+        restaurant_hours = (
+            data.groupby(RESTAURANT_COLUMN)["hour"]
+            .agg(min_hour="min", max_hour="max")
+            .reset_index()
+        )
+        cs = candidate_slots.merge(restaurant_hours, on=RESTAURANT_COLUMN, how="left")
+        working_slots = cs[
+            (cs["slot_hour"] >= cs["min_hour"]) & (cs["slot_hour"] <= cs["max_hour"])
+        ][[RESTAURANT_COLUMN, TIMESTAMP_COLUMN]]
+
+    completed = (
+        working_slots
+        .merge(grouped, on=[RESTAURANT_COLUMN, TIMESTAMP_COLUMN], how="left")
+        .fillna({"orders": 0})
+    )
+    completed["orders"] = completed["orders"].astype(int)
+    return completed
+
+def seasonal_period_from_freq(freq, days=1):
+    period = int(pd.Timedelta(days=days) / pd.Timedelta(freq))
+    return max(period, 1)
+
+def compute_seasonal_strength(series, seasonal_period):
+    if seasonal_period <= 1 or len(series) < 2 * seasonal_period:
+        return 0.0
+    idx = np.arange(len(series)) % seasonal_period
+    seasonal = pd.Series(series).groupby(idx).transform("mean").to_numpy()
+    remainder = series - seasonal
+    var_series = np.var(series)
+    if var_series == 0:
+        return 0.0
+    var_rem = np.var(remainder)
+    return max(0.0, 1.0 - (var_rem / var_series))
+
+def compute_acf(series, lag):
+    if lag <= 0 or len(series) <= lag:
+        return np.nan
+    s = pd.Series(series).dropna()
+    if len(s) <= lag:
+        return np.nan
+    x = s.iloc[:-lag].to_numpy()
+    y = s.iloc[lag:].to_numpy()
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    std_x = np.std(x)
+    std_y = np.std(y)
+    if not np.isfinite(std_x) or not np.isfinite(std_y) or std_x == 0 or std_y == 0:
+        return np.nan
+    return float(np.corrcoef(x, y)[0, 1])
+
+def compute_intermittency(series):
+    nonzero = series[series > 0]
+    n = len(series)
+    nz = len(nonzero)
+    adi = (n / nz) if nz else np.inf
+    if nz > 1:
+        mean_nz = nonzero.mean()
+        cv2 = (nonzero.std(ddof=0) / mean_nz) ** 2 if mean_nz else np.nan
+    else:
+        cv2 = np.nan
+    return adi, cv2
+
+def backtest_seasonal_naive(series, seasonal_period):
+    n = len(series)
+    if n < max(8, seasonal_period * 2):
+        return np.nan, np.nan
+
+    split = int(n * 0.8)
+    train = series[:split]
+    test = series[split:]
+    if len(test) == 0:
+        return np.nan, np.nan
+
+    if seasonal_period <= 1:
+        seasonal_period = 1
+
+    last_season = train[-seasonal_period:]
+    forecast = np.array([last_season[i % seasonal_period] for i in range(len(test))])
+
+    denom = np.abs(test) + np.abs(forecast)
+    smape_terms = np.zeros_like(test, dtype=float)
+    mask = denom != 0
+    smape_terms[mask] = 2.0 * np.abs(test - forecast)[mask] / denom[mask]
+    smape = np.mean(smape_terms)
+
+    if len(train) > seasonal_period:
+        scale = np.mean(np.abs(train[seasonal_period:] - train[:-seasonal_period]))
+    else:
+        scale = np.mean(np.abs(train[1:] - train[:-1])) if len(train) > 1 else 0.0
+    mase = np.mean(np.abs(test - forecast)) / scale if scale else np.nan
+    return mase, smape
+
+def per_restaurant_metrics(series, seasonal_period, weekly_period):
+    arr = series.to_numpy()
+    acf_lag1 = compute_acf(arr, 1)
+    acf_daily = compute_acf(arr, seasonal_period)
+    acf_weekly = compute_acf(arr, weekly_period)
+    season_strength = compute_seasonal_strength(arr, seasonal_period)
+    adi, cv2 = compute_intermittency(arr)
+    mase, smape = backtest_seasonal_naive(arr, seasonal_period)
+    return pd.Series(
+        {
+            "acf_lag1": acf_lag1,
+            "acf_daily": acf_daily,
+            "acf_weekly": acf_weekly,
+            "season_strength": season_strength,
+            "adi": adi,
+            "cv2": cv2,
+            "mase": mase,
+            "smape": smape,
+        }
+    )
+
+def assign_time_bucket(hour):
+    for name, start, end in TIME_BUCKETS:
+        if start <= end:
+            if start <= hour <= end:
+                return name
+        else:
+            if hour >= start or hour <= end:
+                return name
+    return None
+
+def bucket_hours_length(start, end):
+    if start <= end:
+        return end - start + 1
+    return (24 - start) + (end + 1)
+
+def bucket_seasonal_period(base_freq, start, end, days=1):
+    minutes = pd.Timedelta(base_freq).seconds / 60
+    if minutes <= 0:
+        return 1
+    slots_per_hour = int(60 / minutes)
+    hours = bucket_hours_length(start, end)
+    return max(int(hours * slots_per_hour * days), 1)
+
+def popularity_group_from_orders(count):
+    if count < 5000:
+        return "low_lt_5k"
+    if count <= 15000:
+        return "mid_5k_15k"
+    return "high_gt_15k"
+
+def compute_time_bucket_metrics(df, base_freq, min_orders=None):
+    data = filter_min_orders(df.copy(), min_orders)
+    if data.empty:
+        return pd.DataFrame()
+
+    engine = build_engine()
+    work_hours_df = load_work_hours_df(engine)
+    completed = build_completed_slots(data, base_freq, work_hours_df=work_hours_df)
+    if completed.empty:
+        return pd.DataFrame()
+
+    completed["hour"] = completed[TIMESTAMP_COLUMN].dt.hour
+    completed["time_bucket"] = completed["hour"].apply(assign_time_bucket)
+    completed = completed[completed["time_bucket"].notna()].copy()
+
+    orders_per_rest = data.groupby(RESTAURANT_COLUMN).size()
+    group_map = orders_per_rest.apply(popularity_group_from_orders)
+    completed["pop_group"] = completed[RESTAURANT_COLUMN].map(group_map)
+
+    results = []
+    bucket_map = {name: (start, end) for name, start, end in TIME_BUCKETS}
+    for pop_group in ["all"] + sorted(completed["pop_group"].dropna().unique().tolist()):
+        if pop_group == "all":
+            subset = completed
+        else:
+            subset = completed[completed["pop_group"] == pop_group]
+
+        for bucket_name, start, end in TIME_BUCKETS:
+            bucket_df = subset[subset["time_bucket"] == bucket_name]
+            if bucket_df.empty:
+                results.append(
+                    {
+                        "time_bucket": bucket_name,
+                        "pop_group": pop_group,
+                        "base_freq": base_freq,
+                        "slots": 0,
+                        "mean_orders_per_slot": 0.0,
+                        "std_orders_per_slot": 0.0,
+                        "var_orders_per_slot": 0.0,
+                        "cv": 0.0,
+                        "zero_share": 0.0,
+                        "p50": 0.0,
+                        "p90": 0.0,
+                        "p99": 0.0,
+                        "restaurants": 0,
+                        "acf_lag1_median": np.nan,
+                        "acf_daily_median": np.nan,
+                        "acf_weekly_median": np.nan,
+                        "season_strength_median": np.nan,
+                        "adi_median": np.nan,
+                        "cv2_median": np.nan,
+                        "mase_median": np.nan,
+                        "smape_median": np.nan,
+                    }
+                )
+                continue
+
+            slot_counts = bucket_df["orders"]
+            mean_orders = slot_counts.mean()
+            std_orders = slot_counts.std(ddof=0)
+
+            seasonal_period = bucket_seasonal_period(base_freq, start, end, days=1)
+            weekly_period = bucket_seasonal_period(base_freq, start, end, days=7)
+            bucket_df = bucket_df.sort_values([RESTAURANT_COLUMN, TIMESTAMP_COLUMN])
+            per_rest = bucket_df.groupby(RESTAURANT_COLUMN)["orders"].apply(
+                lambda s: per_restaurant_metrics(s, seasonal_period, weekly_period)
+            )
+            if isinstance(per_rest, pd.Series):
+                per_rest = per_rest.unstack()
+            per_rest = per_rest.reset_index()
+            for col in [
+                "acf_lag1",
+                "acf_daily",
+                "acf_weekly",
+                "season_strength",
+                "adi",
+                "cv2",
+                "mase",
+                "smape",
+            ]:
+                if col not in per_rest.columns:
+                    per_rest[col] = np.nan
+
+            results.append(
+                {
+                    "time_bucket": bucket_name,
+                    "pop_group": pop_group,
+                    "base_freq": base_freq,
+                    "slots": len(slot_counts),
+                    "mean_orders_per_slot": mean_orders,
+                    "std_orders_per_slot": std_orders,
+                    "var_orders_per_slot": slot_counts.var(ddof=0),
+                    "cv": std_orders / mean_orders if mean_orders else 0,
+                    "zero_share": (slot_counts == 0).mean(),
+                    "p50": slot_counts.median(),
+                    "p90": slot_counts.quantile(0.9),
+                    "p99": slot_counts.quantile(0.99),
+                    "restaurants": per_rest[RESTAURANT_COLUMN].nunique(),
+                    "acf_lag1_median": per_rest["acf_lag1"].median(),
+                    "acf_daily_median": per_rest["acf_daily"].median(),
+                    "acf_weekly_median": per_rest["acf_weekly"].median(),
+                    "season_strength_median": per_rest["season_strength"].median(),
+                    "adi_median": per_rest["adi"].replace(np.inf, np.nan).median(),
+                    "cv2_median": per_rest["cv2"].median(),
+                    "mase_median": per_rest["mase"].median(),
+                    "smape_median": per_rest["smape"].median(),
+                }
+            )
+
+    return pd.DataFrame(results)
 
 def basic_summary(df):
     print("\n=== Basic summary ===")
@@ -147,7 +480,7 @@ def plot_top_restaurant_profiles(df, top_n=8):
     axes[-1].set_xlabel("Hour")
     plot_and_save(fig, "top_restaurant_profiles.png")
 
-def calculate_granularity_metrics(df, intervals=("15min", "30min", "1h", "2h", "3h")):
+def calculate_granularity_metrics(df, intervals=("15min", "30min", "1h", "2h", "3h", "4h")):
     results = []
     restaurant_ids = df[RESTAURANT_COLUMN].dropna().astype(str).unique()
 
@@ -196,7 +529,7 @@ def calculate_granularity_metrics(df, intervals=("15min", "30min", "1h", "2h", "
     return pd.DataFrame(results)
 
 
-def calculate_granularity_metrics2(df, intervals=("15min", "30min", "1h", "2h", "3h"), min_orders=None):
+def calculate_granularity_metrics2(df, intervals=("15min", "30min", "1h", "2h", "3h", "4h"), min_orders=None):
     """
     Считает те же метрики, что и `calculate_granularity_metrics`, но учитывает
     индивидуальный рабочий диапазон часов для каждого ресторана.
@@ -214,44 +547,27 @@ def calculate_granularity_metrics2(df, intervals=("15min", "30min", "1h", "2h", 
     для конкретного ресторана.
     """
 
-    data = df.copy()
+    data = filter_min_orders(df.copy(), min_orders)
+    if data.empty:
+        return pd.DataFrame(
+            {
+                "interval": list(intervals),
+                "slots": [0] * len(intervals),
+                "mean_orders_per_slot": [0.0] * len(intervals),
+                "std_orders_per_slot": [0.0] * len(intervals),
+                "var_orders_per_slot": [0.0] * len(intervals),
+                "cv": [0.0] * len(intervals),
+                "zero_share": [0.0] * len(intervals),
+                "p50": [0.0] * len(intervals),
+                "p90": [0.0] * len(intervals),
+                "p99": [0.0] * len(intervals),
+            }
+        )
 
-    # Фильтруем по минимальному числу заказов, если задано
-    if min_orders is not None:
-        orders_per_rest = data.groupby(RESTAURANT_COLUMN).size()
-        valid_rests = orders_per_rest[orders_per_rest >= min_orders].index
-        data = data[data[RESTAURANT_COLUMN].isin(valid_rests)]
-        if data.empty:
-            return pd.DataFrame(
-                {
-                    "interval": list(intervals),
-                    "slots": [0] * len(intervals),
-                    "mean_orders_per_slot": [0.0] * len(intervals),
-                    "std_orders_per_slot": [0.0] * len(intervals),
-                    "var_orders_per_slot": [0.0] * len(intervals),
-                    "cv": [0.0] * len(intervals),
-                    "zero_share": [0.0] * len(intervals),
-                    "p50": [0.0] * len(intervals),
-                    "p90": [0.0] * len(intervals),
-                    "p99": [0.0] * len(intervals),
-                }
-            )
+    engine = build_engine()
+    work_hours_df = load_work_hours_df(engine)
 
-    # список локаций (строки) — нужен всегда
-    restaurant_ids = data[RESTAURANT_COLUMN].dropna().astype(str).unique().tolist()
-
-    # Попытаемся прочитать расписания из таблицы work_hours в базе
-    use_db_work_hours = True
-    try:
-        engine = build_engine()
-        wh_sql = "SELECT location_id, weekday, working, start_hour, start_minutes, finish_hour, finish_minutes FROM work_hours where working = true"
-        work_hours_df = pd.read_sql_query(text(wh_sql), engine)
-        work_hours_df["location_id"] = work_hours_df["location_id"].astype(str)
-    except Exception:
-        use_db_work_hours = False
-        work_hours_df = None
-
-    if use_db_work_hours and work_hours_df is not None and not work_hours_df.empty:
+    if work_hours_df is not None and not work_hours_df.empty:
         # Печатаем расписания для топ-10 локаций по числу заказов для валидации
         orders_counts = data.groupby(RESTAURANT_COLUMN).size().rename("orders").reset_index()
         top_locs = orders_counts.sort_values("orders", ascending=False).head(10)[RESTAURANT_COLUMN].tolist()
@@ -296,71 +612,9 @@ def calculate_granularity_metrics2(df, intervals=("15min", "30min", "1h", "2h", 
             print(f"location={loc} | " + ", ".join(
                 sched) + f" | orders={int(orders_counts[orders_counts[RESTAURANT_COLUMN] == loc]['orders'].iloc[0])}")
 
-        # restaurant_ids уже определён выше
-    restaurant_ids_df = pd.DataFrame({RESTAURANT_COLUMN: restaurant_ids})
-
     results = []
     for freq in intervals:
-        start = data[TIMESTAMP_COLUMN].min().floor(freq)
-        end = data[TIMESTAMP_COLUMN].max().ceil(freq)
-        periods = pd.date_range(start=start, end=end, freq=freq)
-
-        grouped = (
-            data.groupby([RESTAURANT_COLUMN, pd.Grouper(key=TIMESTAMP_COLUMN, freq=freq)])
-            .size()
-            .rename("orders")
-            .reset_index()
-        )
-
-        periods_df = pd.DataFrame({TIMESTAMP_COLUMN: periods})
-        periods_df["slot_hour"] = periods_df[TIMESTAMP_COLUMN].dt.hour
-        periods_df["slot_minute"] = (
-            periods_df[TIMESTAMP_COLUMN].dt.hour * 60 + periods_df[TIMESTAMP_COLUMN].dt.minute
-        )
-        periods_df["slot_weekday"] = periods_df[TIMESTAMP_COLUMN].dt.dayofweek
-
-        candidate_slots = restaurant_ids_df.merge(periods_df, how="cross")
-
-        if use_db_work_hours and work_hours_df is not None and not work_hours_df.empty:
-            # соединяем с расписаниями по location_id и weekday
-            cs = candidate_slots.merge(
-                work_hours_df,
-                left_on=[RESTAURANT_COLUMN, "slot_weekday"],
-                right_on=["location_id", "weekday"],
-                how="left",
-            )
-
-            # фильтр: рабочий день и слот попадает в интервал (учитываем ночные смены)
-            def slot_in_range(row):
-                if pd.isna(row.get("working")) or not bool(row.get("working")):
-                    return False
-                start_min = int(row.get("start_hour", 0)) * 60 + int(row.get("start_minutes", 0))
-                finish_min = int(row.get("finish_hour", 0)) * 60 + int(row.get("finish_minutes", 0))
-                sm = int(row.get("slot_minute", 0))
-                if start_min <= finish_min:
-                    return (sm >= start_min) and (sm <= finish_min)
-                else:
-                    # overnight: e.g., 20:00 - 03:00
-                    return (sm >= start_min) or (sm <= finish_min)
-
-            cs["in_work"] = cs.apply(slot_in_range, axis=1)
-            working_slots = cs[cs["in_work"]][[RESTAURANT_COLUMN, TIMESTAMP_COLUMN]]
-        else:
-            # fallback: используем минимальный/максимальный час заказов как ранее
-            restaurant_hours = (
-                data.groupby(RESTAURANT_COLUMN)["hour"]
-                .agg(min_hour="min", max_hour="max")
-                .reset_index()
-            )
-            cs = candidate_slots.merge(restaurant_hours, on=RESTAURANT_COLUMN, how="left")
-            working_slots = cs[(cs["slot_hour"] >= cs["min_hour"]) & (cs["slot_hour"] <= cs["max_hour"])][[RESTAURANT_COLUMN, TIMESTAMP_COLUMN]]
-
-        completed = (
-            working_slots
-            .merge(grouped, on=[RESTAURANT_COLUMN, TIMESTAMP_COLUMN], how="left")
-            .fillna({"orders": 0})
-        )
-        completed["orders"] = completed["orders"].astype(int)
+        completed = build_completed_slots(data, freq, work_hours_df=work_hours_df)
 
         slot_counts = completed["orders"]
         mean_orders = slot_counts.mean()
@@ -380,6 +634,59 @@ def calculate_granularity_metrics2(df, intervals=("15min", "30min", "1h", "2h", 
                 "p99": slot_counts.quantile(0.99),
             }
         )
+
+    return pd.DataFrame(results)
+
+def evaluate_interval_forecastability(df, intervals, min_orders=None):
+    data = filter_min_orders(df.copy(), min_orders)
+    if data.empty:
+        return pd.DataFrame()
+
+    engine = build_engine()
+    work_hours_df = load_work_hours_df(engine)
+
+    results = []
+    for freq in intervals:
+        completed = build_completed_slots(data, freq, work_hours_df=work_hours_df)
+        if completed.empty:
+            continue
+
+        seasonal_period = seasonal_period_from_freq(freq, days=1)
+        weekly_period = seasonal_period_from_freq(freq, days=7)
+
+        per_rest = completed.groupby(RESTAURANT_COLUMN)["orders"].apply(
+            lambda s: per_restaurant_metrics(s, seasonal_period, weekly_period)
+        )
+        if isinstance(per_rest, pd.Series):
+            per_rest = per_rest.unstack()
+        per_rest = per_rest.reset_index()
+        expected_cols = [
+            "acf_lag1",
+            "acf_daily",
+            "acf_weekly",
+            "season_strength",
+            "adi",
+            "cv2",
+            "mase",
+            "smape",
+        ]
+        for col in expected_cols:
+            if col not in per_rest.columns:
+                per_rest[col] = np.nan
+
+        summary = {
+            "interval": freq,
+            "restaurants": per_rest[RESTAURANT_COLUMN].nunique(),
+            "acf_lag1_median": per_rest["acf_lag1"].median(),
+            "acf_daily_median": per_rest["acf_daily"].median(),
+            "acf_weekly_median": per_rest["acf_weekly"].median(),
+            "season_strength_median": per_rest["season_strength"].median(),
+            "adi_median": per_rest["adi"].replace(np.inf, np.nan).median(),
+            "cv2_median": per_rest["cv2"].median(),
+            "mase_median": per_rest["mase"].median(),
+            "smape_median": per_rest["smape"].median(),
+        }
+        results.append(summary)
 
     return pd.DataFrame(results)
 
@@ -404,11 +711,61 @@ def plot_granularity_metrics(metrics_df):
 
     plot_and_save(fig, "granularity_metrics.png")
 
+def plot_interval_forecastability(metrics_df):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(metrics_df["interval"], metrics_df["mase_median"], marker="o", label="MASE")
+    axes[0].set_title("Backtest error (median)")
+    axes[0].set_xlabel("Interval")
+    axes[0].set_ylabel("MASE")
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(metrics_df["interval"], metrics_df["smape_median"], marker="o", color="darkorange", label="sMAPE")
+    axes[1].set_title("Backtest error (median)")
+    axes[1].set_xlabel("Interval")
+    axes[1].set_ylabel("sMAPE")
+    axes[1].grid(alpha=0.3)
+
+    plot_and_save(fig, "interval_backtest_metrics.png")
+
+def plot_interval_autocorr(metrics_df):
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(metrics_df["interval"], metrics_df["acf_lag1_median"], marker="o", label="ACF lag1")
+    ax.plot(metrics_df["interval"], metrics_df["acf_daily_median"], marker="o", label="ACF daily")
+    ax.plot(metrics_df["interval"], metrics_df["acf_weekly_median"], marker="o", label="ACF weekly")
+    ax.set_title("Autocorrelation by interval (median)")
+    ax.set_xlabel("Interval")
+    ax.set_ylabel("ACF")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plot_and_save(fig, "interval_autocorr.png")
+
+def plot_interval_intermittency(metrics_df):
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(metrics_df["interval"], metrics_df["adi_median"], marker="o", label="ADI")
+    ax.plot(metrics_df["interval"], metrics_df["cv2_median"], marker="o", label="CV2")
+    ax.set_title("Intermittency by interval (median)")
+    ax.set_xlabel("Interval")
+    ax.set_ylabel("Value")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plot_and_save(fig, "interval_intermittency.png")
+
 def export_metrics(metrics_df, suffix=""):
     if suffix:
         path = OUTPUT_DIR / f"granularity_metrics_{suffix}.csv"
     else:
         path = OUTPUT_DIR / "granularity_metrics.csv"
+    metrics_df.to_csv(path, index=False)
+    print(f"Saved: {path}")
+
+def export_interval_metrics(metrics_df):
+    path = OUTPUT_DIR / "interval_forecastability_metrics.csv"
+    metrics_df.to_csv(path, index=False)
+    print(f"Saved: {path}")
+
+def export_time_bucket_metrics(metrics_df):
+    path = OUTPUT_DIR / "time_bucket_metrics.csv"
     metrics_df.to_csv(path, index=False)
     print(f"Saved: {path}")
 
@@ -428,15 +785,17 @@ def run_analysis(limit=None, where_clause=None):
     ## считаем базовую инфу
     basic_summary(df)
 
+    intervals = ("15min", "30min", "1h", "2h", "3h", "4h")
+
     ## подготовливаем метрики для всех локаций
-    metrics_df = calculate_granularity_metrics2(df)
+    metrics_df = calculate_granularity_metrics2(df, intervals=intervals)
 
     print("\n=== Granularity comparison (all locations) ===")
     print(metrics_df.to_string(index=False))
     export_metrics(metrics_df)
 
     ## подготовливаем метрики только для локаций с >= 5000 заказов
-    metrics_df_filtered = calculate_granularity_metrics2(df, min_orders=5000)
+    metrics_df_filtered = calculate_granularity_metrics2(df, intervals=intervals, min_orders=5000)
     print("\n=== Granularity comparison (locations with >= 5000 orders) ===")
     print(metrics_df_filtered.to_string(index=False))
     export_metrics(metrics_df_filtered, suffix="5k_plus")
@@ -446,6 +805,21 @@ def run_analysis(limit=None, where_clause=None):
     plot_restaurant_distribution(df)
     plot_top_restaurant_profiles(df)
     plot_granularity_metrics(metrics_df)
+
+    print("\n=== Interval forecastability metrics (median per restaurant) ===")
+    forecast_metrics = evaluate_interval_forecastability(df, intervals=intervals)
+    if not forecast_metrics.empty:
+        print(forecast_metrics.to_string(index=False))
+        export_interval_metrics(forecast_metrics)
+        plot_interval_forecastability(forecast_metrics)
+        plot_interval_autocorr(forecast_metrics)
+        plot_interval_intermittency(forecast_metrics)
+
+    print("\n=== Time-bucket metrics by popularity group ===")
+    time_bucket_metrics = compute_time_bucket_metrics(df, base_freq=TIME_BUCKET_BASE_FREQ)
+    if not time_bucket_metrics.empty:
+        print(time_bucket_metrics.to_string(index=False))
+        export_time_bucket_metrics(time_bucket_metrics)
     daily_trend(df)
 
 def daily_trend(df):
